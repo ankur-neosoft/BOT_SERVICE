@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  decision:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - redis
+
+  distributor:
+    build: .
+    command: python AuctionInfoDistributor.py
+    depends_on:
+      - decision
+      - redis
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  player:
+    build: .
+    command: python AuctionPlayer.py
+    depends_on:
+      - distributor
+      - redis
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  # Redis for state persistence / multi-process coordination
+  redis:
+    image: redis:7-alpine
+    container_name: bot_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  redis_data:
