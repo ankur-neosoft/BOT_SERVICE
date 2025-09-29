@@ -41,3 +41,13 @@ HYSTERESIS_WINDOW_SEC = int(os.getenv("HYSTERESIS_WINDOW_SEC", "30"))
 # Production: SHOW_BOTS_TO_USERS should be True. UAT: you may set False if you hide from users.
 SHOW_BOTS_TO_USERS = os.getenv("SHOW_BOTS_TO_USERS", "True").lower() in ("1","true","yes")
 ALLOW_HIDDEN_BOTS_IN_UAT = os.getenv("ALLOW_HIDDEN_BOTS_IN_UAT", "True").lower() in ("1","true","yes")
+
+# config.py (append under existing tunables)
+# Auction extension behaviour (seconds)
+AUCTION_EXTENSION_SECONDS = int(os.getenv("AUCTION_EXTENSION_SECONDS", "60"))        # how many seconds to extend
+AUCTION_EXTENSION_THRESHOLD_SEC = int(os.getenv("AUCTION_EXTENSION_THRESHOLD_SEC", "60"))  # threshold to trigger extension (1 min)
+
+# Bot percent-of-threshold fallback cap (optional): if API doesn't provide absolute cap,
+# we may enforce "no bots beyond X% of threshold" as a safety net.
+BOT_MAX_PERCENT_OF_THRESHOLD = float(os.getenv("BOT_MAX_PERCENT_OF_THRESHOLD", "0.95"))
+

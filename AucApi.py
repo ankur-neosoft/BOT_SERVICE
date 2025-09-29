@@ -5,7 +5,7 @@
 
 import requests
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime
@@ -129,3 +129,41 @@ def get_auction_time_from_snapshot(snapshot: dict, auction_id: str) -> Dict[str,
     except Exception as e:
         logger.exception("get_auction_time_from_snapshot")
         return {'status': 'error', 'message': str(e)}
+    
+
+def extract_max_allowed_price_from_snapshot(snapshot: dict, auction_id: str) -> Optional[float]:
+    """
+    Robustly extract 'max allowed price' from the snapshot structure.
+    Tries several common keys used in your older format:
+      - snapshot[auction_id]['MAX_BID_AMOUNT']
+      - snapshot[auction_id]['MIN_BID_AMOUNT'] and snapshot[auction_id]['MAX_BID_AMOUNT']
+      - snapshot[auction_id]['MAX_BID'] (alternate)
+      - snapshot[auction_id]['AUCTION_ITEMS'][item_id]['MAX_BID_AMOUNT'] (if per-item)
+    Return None if not present.
+    """
+    try:
+        a = snapshot.get(auction_id) if isinstance(snapshot, dict) else None
+        if not a:
+            return None
+        # top-level values
+        for k in ("MAX_BID_AMOUNT", "MAX_BID", "BOT_MAX_ALLOWED_PRICE"):
+            if k in a and a[k] not in (None, ""):
+                try:
+                    return float(a[k])
+                except Exception:
+                    pass
+        # per-item check (pick first item if present)
+        items = a.get("AUCTION_ITEMS") or a.get("AUCTION_ITEM") or a.get("ITEMS")
+        if isinstance(items, dict) and items:
+            # items keyed by id; check first item's MAX_BID_AMOUNT
+            first_item = next(iter(items.values()))
+            for k in ("MAX_BID_AMOUNT", "MAX_BID"):
+                if k in first_item and first_item[k] not in (None, ""):
+                    try:
+                        return float(first_item[k])
+                    except Exception:
+                        pass
+        return None
+    except Exception:
+        return None
+
