@@ -7,24 +7,23 @@ from datetime import datetime, timedelta
 from dateutil.parser import parse
 
 from app.services.decision_service import DecisionService
-from AucApi import (
-    submit_bid,
-    get_current_bidding_details,
-    extract_max_allowed_price_from_snapshot,
-    get_auction_time_from_snapshot
-)
+from AucApi import submit_bid, get_current_bidding_details, extract_max_allowed_price_from_snapshot, get_auction_time_from_snapshot
 from state_store import (
     get_bot_state, persist_bot_state,
     is_bot_assigned, assign_bot, assigned_bot_for,
     set_bots_disabled, is_bots_disabled,
     set_expiry_override, get_expiry_override
 )
+import AucApi
 from config import bot_user_ids, AUCTION_EXTENSION_SECONDS, AUCTION_EXTENSION_THRESHOLD_SEC, BOT_MAX_PERCENT_OF_THRESHOLD
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuctionPlayer")
 
 DECISION = DecisionService()
+
+MAX_WAIT = 25  # maximum wait (seconds) allowed for scheduled bidding
+
 
 def process_external_snapshot(snapshot):
     """
@@ -72,15 +71,15 @@ def _safe_get_current_best(auc_id, item_id, fallback):
     The AucApi.get_current_bidding_details should return a structure with 'best_price' or equivalent.
     """
     try:
-        details = get_current_bidding_details(auc_id, item_id)  # adapt if your API signature differs
-        if isinstance(details, dict):
-            # common keys: 'best_price', 'current_bid', 'current_highest'
-            for key in ("best_price", "current_bid", "current_highest", "current_price"):
-                if key in details:
-                    return float(details[key] or 0)
-        # if a number was returned directly
-        if isinstance(details, (int, float)):
-            return float(details)
+        if hasattr(AucApi, "get_current_bidding_details"):
+            details = get_current_bidding_details(auc_id, item_id)
+            if isinstance(details, dict):
+                # common keys: 'best_price', 'current_bid', 'current_highest'
+                for key in ("best_price", "current_bid", "current_highest", "current_price"):
+                    if key in details:
+                        return float(details[key] or 0)
+            if isinstance(details, (int, float)):
+                return float(details)
     except Exception:
         logger.debug("Could not fetch live current bid for %s:%s (falling back).", auc_id, item_id, exc_info=True)
     return float(fallback or 0.0)
@@ -91,12 +90,10 @@ def process_snapshot(snapshot):
     Called whenever we receive the latest published snapshot (snapshot is dict of auctions)
     Strategy:
       - For each auction in snapshot, if a bot is assigned to that auction we will decide and place a bid
-      - Respect max wait time (25s)
-      - If someone else bids during our wait, skip submitting
-      - Only submit once per quiet period (do not continuously rebid unless someone else outbids us)
+      - Respect max wait time (MAX_WAIT)
+      - If someone else bids during our wait, skip submitting (prevents stale submits)
+      - Allow repeated bidding by the bot until threshold/cap is reached
     """
-    MAX_WAIT = 25  # seconds cap for any bot wait (requirement)
-
     for auc_id, auc in snapshot.items():
         # Defensive: skip if auction id is falsy (None / empty). Prevent assigning bots to None.
         if not auc_id:
@@ -159,20 +156,6 @@ def process_snapshot(snapshot):
             # last_seen_external_best: external best price observed after bot's last bid
         }
 
-        # Prevent continuous bidding: if we previously placed a bid and no one else outbid it, skip.
-        last_bot_bid = state.get("last_bot_bid_amount")
-        # get most recent live best (best_before_decide)
-        live_best_before = _safe_get_current_best(auc_id, r.item_id, snapshot_best)
-
-        if last_bot_bid is not None:
-            # If we earlier placed a bid and the live best is still <= our last bid,
-            # that means nobody outbid us — so do not attempt another bid now.
-            if live_best_before <= float(last_bot_bid):
-                logger.info("Auction %s: bot %s has last_bot_bid=%.2f and live_best=%.2f -> skipping re-bid until someone outbids",
-                            auc_id, bot_id, float(last_bot_bid), live_best_before)
-                continue
-            # If someone outbid our last bid (live_best_before > last_bot_bid), we allow decision flow to run.
-
         # Now run DecisionService
         decision = DECISION.decide(r, state)
         if decision.get("status") != "ok":
@@ -182,7 +165,7 @@ def process_snapshot(snapshot):
         # Extract decision results
         bid_amount_raw = decision.get("bid_amount")
         requested_delay = int(decision.get("delay_seconds") or 1)
-        # Cap requested delay to MAX_WAIT to satisfy requirement #2
+        # Cap requested delay to MAX_WAIT
         delay = min(requested_delay, MAX_WAIT)
 
         # Recompute best_price from live API to reduce stale decisions:
@@ -249,7 +232,7 @@ def process_snapshot(snapshot):
         time.sleep(delay)
 
         # After waiting, check live best price again. If someone else bid higher AFTER our decision time,
-        # the bot should NOT submit its scheduled bid (requirement #1 and #3).
+        # the bot should NOT submit its scheduled bid (avoid stale submits).
         live_best_after = _safe_get_current_best(auc_id, r.item_id, snapshot_best)
 
         # If someone else placed a higher bid than the best_price_at_decision,
@@ -263,38 +246,28 @@ def process_snapshot(snapshot):
             persist_bot_state(auc_id, bot_id, st2)
             continue
 
-        # Additionally: if we previously placed a bid and live_best_after <= last_bot_bid, then do not re-bid.
-        last_bot_bid = state.get("last_bot_bid_amount")
-        if last_bot_bid is not None and live_best_after <= float(last_bot_bid):
-            logger.info("Auction %s: bot %s had last_bot_bid=%.2f and live_best_after=%.2f -> no re-bid",
-                        auc_id, bot_id, float(last_bot_bid), float(live_best_after))
-            st2 = get_bot_state(auc_id, bot_id) or {}
-            st2["next_scheduled"] = None
-            persist_bot_state(auc_id, bot_id, st2)
-            continue
-
         # Submit using the computed absolute final price
         submit_resp = submit_bid(auction_id=auc_id, item_id=r.item_id, bid_amount=resulting_price, user_id=bot_id)
         logger.info("Submit bid response: %s", submit_resp)
 
-        # persist updated state: mark that bot placed this bid. This ensures we won't continuously re-bid.
+        # persist updated state: mark that bot placed this bid.
         updated_state = decision.get("updated_state", state)
         updated_state["num_bids_placed"] = updated_state.get("num_bids_placed", 0) + 1
         updated_state["last_action_time"] = datetime.utcnow().isoformat() + "Z"
         updated_state["next_scheduled"] = None
 
-        # Record the absolute price bot placed so we can avoid re-bidding until someone else raises it.
+        # Record the absolute price bot placed so we can reference it later if needed.
         if submit_resp.get("status") == "success":
             updated_state["last_bot_bid_amount"] = float(resulting_price)
             # We can track last_seen_external_best as well.
             updated_state["last_seen_external_best"] = float(_safe_get_current_best(auc_id, r.item_id, resulting_price))
         else:
-            # If submit failed, do not set last_bot_bid_amount
+            # If submit failed, preserve previous value
             updated_state["last_bot_bid_amount"] = updated_state.get("last_bot_bid_amount")
 
         persist_bot_state(auc_id, bot_id, updated_state)
 
-        # Post-submit: expiry/extension / caps as before
+        # Post-submit: handle expiry extension and cap checks as before
         if submit_resp.get("status") == "success":
             expiry_iso = get_expiry_override(auc_id) or auc.get("AUCTION_EXPIRY_DATE_TIME") or auc.get("EXPIRY")
             expiry_dt = None
@@ -322,3 +295,24 @@ def process_snapshot(snapshot):
             st = get_bot_state(auc_id, bot_id) or {}
             st["next_scheduled"] = None
             persist_bot_state(auc_id, bot_id, st)
+
+
+# optional main runner (commented)
+# def main():
+#     ctx = zmq.Context()
+#     sock = ctx.socket(zmq.SUB)
+#     sock.setsockopt(zmq.SUBSCRIBE, b"")  # subscribe to everything
+#     sock.setsockopt(zmq.CONFLATE, 1)     # keep only latest message
+#     sock.connect("tcp://localhost:9505")
+#     logger.info("Player connected to tcp://localhost:9505")
+#
+#     while True:
+#         try:
+#             snapshot = sock.recv_json()  # blocking
+#             process_snapshot(snapshot)
+#         except Exception:
+#             logger.exception("Player loop error")
+#             time.sleep(1)
+#
+# if __name__ == "__main__":
+#     main()

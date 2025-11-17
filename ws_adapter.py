@@ -1,13 +1,14 @@
 """
-ws_adapter.py (final)
+ws_adapter.py (final, patched)
 
-- Logs in via session cookie
-- Opens WebSocket with cookie header (single persistent connection used for receiving snapshots)
-- Joins auction(s)
-- Converts incoming WS messages to AuctionPlayer snapshot shape
-- Calls process_external_snapshot(snapshot)
-- Monkey-patches AucApi.submit_bid AND AuctionPlayer.submit_bid to send bids via ephemeral websocket
-  (open -> send -> await response -> close), with an optional pre-check against current_bid.
+- Logs in via session cookie (requests.Session)
+- Starts a persistent WS for receiving snapshots (auto-reconnect)
+- Converts join/update messages to AuctionPlayer snapshot shape (caches item metadata)
+- Monkey-patches AucApi.submit_bid and AuctionPlayer.submit_bid to use ephemeral WS per bid
+  (open -> send -> await response -> close) with:
+    - per-auction rate limiting
+    - pre-check against current live bid
+    - caching of MIN_BID_AMOUNT to avoid fallback to 1
 """
 
 import json
@@ -15,62 +16,70 @@ import time
 import threading
 import uuid
 import logging
+import random
 import requests
 import websocket  # pip install websocket-client
 
-# Import the AuctionPlayer snapshot entry point and module
+# Import AuctionPlayer and AucApi
 from AuctionPlayer import process_external_snapshot
 import AuctionPlayer
 import AucApi  # we will monkey-patch submit_bid here
 
-# ---------- CONFIG - adjust as needed ----------
-HTTP_BASE = "http://localhost:8000"                # web_click_for_steel base (used for login only)
-LOGIN_PATH = "/CFS/master/login"                   # login endpoint
-WS_BASE = "ws://localhost:8000"                    # ws base (ws:// or wss://)
-WS_JOIN_PATH = "/CFS/ws/auction/join/"             # from routing.py
+# ---------- CONFIG ----------
+HTTP_BASE = "http://localhost:8000"
+LOGIN_PATH = "/CFS/master/login"
+WS_BASE = "ws://localhost:8000"
+WS_JOIN_PATH = "/CFS/ws/auction/join/"
 
-USERNAME = "bansari"                               # change to your bot username
-PASSWORD = "12345"                                 # change to your bot password
-AUCTION_PK = "423d9642-fad7-43a2-ba3a-503199225809"  # auction primary key to join
+USERNAME = "bansari"
+PASSWORD = "12345"
+AUCTION_PK = "423d9642-fad7-43a2-ba3a-503199225809"
 REQUEST_ID = str(uuid.uuid4())
-# -------------------------------------------------
+
+# Ephemeral submit tuning
+EPHEMERAL_CONNECT_TIMEOUT = 4     # seconds to connect
+EPHEMERAL_RECV_TIMEOUT = 4        # seconds to wait for response
+EPHEMERAL_MIN_INTERVAL = 0.8      # seconds between ephemeral submits per auction
+EPHEMERAL_JITTER = 0.25           # random jitter added
+
+# Persistent WS ping settings (must satisfy ping_interval > ping_timeout)
+PERSISTENT_PING_INTERVAL = 30
+PERSISTENT_PING_TIMEOUT = 10
 
 logger = logging.getLogger("ws_adapter")
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
 
-# global websocket object (live ws connection). Set in _on_open.
+# global persistent websocket object (live ws connection). Set in _on_open.
 _global_ws = None
 _global_ws_lock = threading.Lock()
+
+# Cache last-known per-auction item metadata so updates missing fields don't regress min_inc
+_LAST_ITEM_MAP = {}  # auction_id -> {item_id: item_block}
+# Track last ephemeral submit times per auction (rate-limit)
+_LAST_EPHEMERAL_SUBMIT = {}  # auction_id -> last_ts
+_LAST_EPHEMERAL_LOCK = threading.Lock()
 
 
 def login_and_get_session(username, password):
     s = requests.Session()
     login_url = HTTP_BASE + LOGIN_PATH
-
-    # Try POST JSON (your login endpoint is POST-only)
     payload = {"username": username, "password": password}
     r = s.post(login_url, json=payload, allow_redirects=True, timeout=10)
-
     if r.status_code not in (200, 302):
         raise RuntimeError(f"Login failed: {r.status_code} {r.text[:400]}")
-
     sessionid = s.cookies.get("cfs-sessionid") or s.cookies.get("sessionid")
     if not sessionid:
         raise RuntimeError("No session cookie received after login")
-
-    # debug: print cookies returned so we know exact names
     logger.info("Login cookies: %s", s.cookies.get_dict())
     print("Cookies:", s.cookies.get_dict())
-
     logger.info("Logged in successfully, session cookie found.")
     return s
 
 
 def _send_via_ws(payload: dict) -> bool:
     """
-    Thread-safe send helper (uses persistent main WS). Returns True on success, False otherwise.
-    This remains useful for non-ephemeral sends if you want to use the main connection.
+    Use persistent WS to send a payload (not used for ephemeral submits but kept as a helper).
     """
     global _global_ws
     with _global_ws_lock:
@@ -78,13 +87,11 @@ def _send_via_ws(payload: dict) -> bool:
             logger.error("WebSocket is not connected - cannot send payload")
             return False
         try:
-            # _global_ws is the live websocket connection (set in _on_open)
             _global_ws.send(json.dumps(payload))
-            logger.info("WS SENT: %s", payload)
+            logger.info("WS SENT (persistent): %s", payload)
             return True
-        except Exception as e:
-            logger.exception("Failed to send via WS: %s", e)
-            # mark socket dead so reconnect loop (if any) can recreate it
+        except Exception:
+            logger.exception("Failed to send via persistent WS - marking dead")
             try:
                 _global_ws.close()
             except Exception:
@@ -93,24 +100,10 @@ def _send_via_ws(payload: dict) -> bool:
             return False
 
 
-# Keep the original small ws submit as fallback (unused when we patch to ephemeral)
-def _ws_submit_bid(auction_id: str, item_id: int, bid_amount: float, user_id: str = None, min_bid_amount: float = None):
-    payload = {
-        "action": "place_bid",
-        "product_id": item_id,
-        "bid": float(bid_amount)
-    }
-    ok = _send_via_ws(payload)
-    if ok:
-        # mimic AucApi response shape
-        return {"status": "success", "message": {"via": "ws", "payload": payload}}
-    else:
-        return {"status": "error", "message": "ws-send-failed"}
-
-
 def _convert_join_response_to_snapshot(join_data: dict):
     """
     Convert server 'auction_data' payload -> AuctionPlayer snapshot format.
+    Cache item metadata (MIN_BID_AMOUNT etc.) so later updates that omit fields don't regress values.
     """
     try:
         auction_id = join_data.get("auction_id")
@@ -122,25 +115,29 @@ def _convert_join_response_to_snapshot(join_data: dict):
         item_map = {}
         for p in products:
             pid = p.get("auction_product_id")
-            # adapt this filter as needed; earlier you filtered pid == 6 in tests
-            # we'll include all products by default
-            if pid is not None:
-                item_map[pid] = {
-                    "ITEM_ID": pid,
-                    "BEST_PRICE": float(p.get("current_bid") or p.get("starting_bid") or 0),
-                    "THRESHOLD_PRICE": float(p.get("reserve_price") or 0),
-                    "MIN_BID_AMOUNT": float(p.get("minimum_increment_price") or 1),
-                    "MAX_BID_AMOUNT": float(p.get("max_allowed_price") or 999999999)
-                }
-
-        # If every item uses the same MIN_BID_AMOUNT we can set an auction-level MIN_BID_AMOUNT.
+            # skip item id 7 as per your custom filter
+            if pid == 7:
+                continue
+            raw_min = p.get("minimum_increment_price")
+            min_bid = float(raw_min) if raw_min is not None else None
+            item = {
+                "ITEM_ID": pid,
+                "BEST_PRICE": float(p.get("current_bid") or p.get("starting_bid") or 0),
+                "THRESHOLD_PRICE": float(p.get("reserve_price") or 0),
+                # if min not present, we'll set to 1 for snapshot but also cache None -> handle later
+                "MIN_BID_AMOUNT": min_bid if min_bid is not None else 1,
+                "MAX_BID_AMOUNT": float(p.get("max_allowed_price") or 999999999)
+            }
+            item_map[pid] = item
+        # cache metadata
+        if auction_id:
+            _LAST_ITEM_MAP[auction_id] = {k: v.copy() for k, v in item_map.items()}
         auction_block = {"AUCTION_ITEMS": item_map}
-        # compute common item-level min if items exist
         if item_map:
             item_mins = {v.get("MIN_BID_AMOUNT") for v in item_map.values() if v.get("MIN_BID_AMOUNT") is not None}
             if len(item_mins) == 1:
                 auction_block["MIN_BID_AMOUNT"] = next(iter(item_mins))
-        logger.debug("Converted join -> snapshot: %s", item_map)
+        logger.debug("join -> snapshot: auction=%s items=%s", auction_id, item_map)
         return {auction_id: auction_block}
     except Exception:
         logger.exception("Error converting join response to snapshot")
@@ -149,20 +146,34 @@ def _convert_join_response_to_snapshot(join_data: dict):
 
 def _convert_update_to_snapshot(update_msg: dict):
     """
-    Convert an 'update_bid' message into a snapshot.
+    Convert 'update_bid' message into a snapshot. Use cached MIN_BID_AMOUNT when update omits it.
     """
     try:
         product = update_msg.get("product") or {}
         pid = product.get("auction_product_id") or product.get("id")
-        # Get auction id from update message; fall back to global AUCTION_PK to avoid None.
         auction_id = update_msg.get("auction_id") or update_msg.get("auctionId") or AUCTION_PK
+        raw_min = product.get("minimum_increment_price")
+        if raw_min is None:
+            # fallback to cached value if present
+            try:
+                cached = _LAST_ITEM_MAP.get(auction_id, {})
+                min_bid = cached.get(pid, {}).get("MIN_BID_AMOUNT", 1)
+            except Exception:
+                min_bid = 1
+        else:
+            min_bid = float(raw_min)
         item_block = {
             "ITEM_ID": pid,
             "BEST_PRICE": float(product.get("current_bid") or product.get("starting_bid") or 0),
             "THRESHOLD_PRICE": float(product.get("reserve_price") or 0),
-            "MIN_BID_AMOUNT": float(product.get("minimum_increment_price") or 1),
+            "MIN_BID_AMOUNT": min_bid,
             "MAX_BID_AMOUNT": float(product.get("max_allowed_price") or 999999999)
         }
+        # Update cache
+        if auction_id not in _LAST_ITEM_MAP:
+            _LAST_ITEM_MAP[auction_id] = {}
+        _LAST_ITEM_MAP[auction_id][pid] = item_block.copy()
+
         snapshot = {
             auction_id: {
                 "AUCTION_ITEMS": {
@@ -170,7 +181,6 @@ def _convert_update_to_snapshot(update_msg: dict):
                 }
             }
         }
-        # Set auction-level MIN_BID_AMOUNT equal to the item min (do NOT force 1)
         snapshot[auction_id]["MIN_BID_AMOUNT"] = item_block["MIN_BID_AMOUNT"]
         return snapshot
     except Exception:
@@ -180,14 +190,9 @@ def _convert_update_to_snapshot(update_msg: dict):
 
 # WebSocket callbacks
 def _on_open(ws):
-    """
-    IMPORTANT: set the global live websocket object here so _send_via_ws() can use it.
-    The 'ws' argument is the live connection (not WebSocketApp).
-    """
     global _global_ws
     with _global_ws_lock:
         _global_ws = ws
-
     logger.info("WS open. Sending join_auction for auction=%s", AUCTION_PK)
     payload = {"pk": AUCTION_PK, "action": "join_auction", "request_id": str(uuid.uuid4())}
     try:
@@ -202,28 +207,21 @@ def _on_message(ws, message):
     except Exception:
         logger.debug("Non-json WS message: %s", message)
         return
-
-    # Join response with auction_data
     if data.get("status") == "success" and "auction_data" in data:
         logger.info("Join confirmed for auction: %s", data.get("auction_id"))
         snap = _convert_join_response_to_snapshot(data)
         if snap:
             process_external_snapshot(snap)
         return
-
-    # update_bid messages
     action = data.get("action") or data.get("type")
     if action == "update_bid" or data.get("event") == "update_bid":
         snap = _convert_update_to_snapshot(data)
         if snap:
             process_external_snapshot(snap)
         return
-
-    # bid_response or other messages: log
     if action == "bid_response" or data.get("status") == "bid_response":
         logger.info("Bid response from server: %s", data)
         return
-
     logger.debug("Unhandled WS message: %s", data)
 
 
@@ -240,10 +238,9 @@ def _on_close(ws, code, reason):
 
 def start_ws_adapter(username, password, auction_pk=None):
     """
-    Start the adapter:
-      - login (requests.Session) and build cookie header
-      - start persistent WS for receiving snapshots
-      - monkey-patch AucApi.submit_bid and AuctionPlayer.submit_bid to use ephemeral WS per bid
+    - login -> session (used for cookie header)
+    - start persistent receive WS in reconnect loop
+    - patch submit_bid to ephemeral submit
     """
     global _global_ws, AUCTION_PK
     if auction_pk:
@@ -251,15 +248,12 @@ def start_ws_adapter(username, password, auction_pk=None):
 
     session = login_and_get_session(username, password)
 
-    # Build cookie header from all cookies returned by the login session
     cookies_dict = session.cookies.get_dict()
     cookie_parts = [f"{k}={v}" for k, v in cookies_dict.items()]
     cookie_header = "; ".join(cookie_parts)
 
-    # use Origin via run_forever below, don't include Origin header string to avoid mangling
     origin = "http://localhost:8000"
     host = "localhost:8000"
-
     ws_url = WS_BASE + WS_JOIN_PATH
     headers = [
         f"Cookie: {cookie_header}",
@@ -270,50 +264,39 @@ def start_ws_adapter(username, password, auction_pk=None):
     ]
 
     logger.info("Connecting to WS: %s", ws_url)
-    ws_app = websocket.WebSocketApp(ws_url,
-                                    header=headers,
-                                    on_open=_on_open,
-                                    on_message=_on_message,
-                                    on_error=_on_error,
-                                    on_close=_on_close)
 
-    # -------------------------
-    # Ephemeral WS submit implementation (closure uses cookie_header, origin, ws_url)
-    # -------------------------
-    def _ephemeral_ws_submit(auction_id: str, item_id: int, bid_amount: float, user_id: str = None, min_bid_amount: float = None, timeout: int = 5):
-        """
-        Open a short-lived websocket, send single place_bid payload, wait for a single response, close.
-        Performs an optional pre-check using AucApi.get_current_bidding_details to avoid wasted connections.
-        Returns a dict in the shape the rest of the code expects.
-        """
+    # ---------------- ephemeral submit implementation ----------------
+    def _ephemeral_ws_submit(auction_id: str, item_id: int, bid_amount: float, user_id: str = None, min_bid_amount: float = None, timeout: int = EPHEMERAL_CONNECT_TIMEOUT):
+        # rate-limit per-auction
+        with _LAST_EPHEMERAL_LOCK:
+            last = _LAST_EPHEMERAL_SUBMIT.get(auction_id, 0)
+            wait_needed = EPHEMERAL_MIN_INTERVAL + random.random() * EPHEMERAL_JITTER - (time.time() - last)
+            if wait_needed > 0:
+                logger.debug("Rate-limit: sleeping %.3fs before ephemeral submit for auction %s", wait_needed, auction_id)
+                time.sleep(wait_needed)
+            _LAST_EPHEMERAL_SUBMIT[auction_id] = time.time()
+
         payload = {"action": "place_bid", "product_id": item_id, "bid": float(bid_amount)}
-        # Optional pre-check: ask live API if current bid already >= intended bid — skip if so.
+        # pre-check to avoid wasted connections
         try:
             if hasattr(AucApi, "get_current_bidding_details"):
-                try:
-                    details = AucApi.get_current_bidding_details(auction_id, item_id)
-                    # details might be dict with 'current_bid' or 'best_price'
-                    if isinstance(details, dict):
-                        for key in ("current_bid", "best_price", "current_highest", "current_price"):
-                            if key in details:
-                                current_live = float(details[key] or 0)
-                                if current_live >= float(bid_amount):
-                                    logger.info("Ephemeral submit: current_live(=%s) >= bid_amount(=%s) -> skipping open ws", current_live, bid_amount)
-                                    return {"status": "error", "message": f"skipped-stale-bid:live_bid={current_live}"}
-                                break
-                    elif isinstance(details, (int, float)):
-                        current_live = float(details)
-                        if current_live >= float(bid_amount):
-                            logger.info("Ephemeral submit: current_live(=%s) >= bid_amount(=%s) -> skipping open ws", current_live, bid_amount)
-                            return {"status": "error", "message": f"skipped-stale-bid:live_bid={current_live}"}
-                except Exception:
-                    # pre-check failure: proceed with ephemeral submit (fail-open)
-                    logger.debug("Ephemeral submit pre-check failed; proceeding to open ephemeral ws", exc_info=True)
+                details = AucApi.get_current_bidding_details(auction_id, item_id)
+                if isinstance(details, dict):
+                    for key in ("current_bid", "best_price", "current_highest", "current_price"):
+                        if key in details:
+                            current_live = float(details[key] or 0)
+                            if current_live >= float(bid_amount):
+                                logger.info("Ephemeral pre-check: live bid(=%.2f) >= proposed(=%.2f) -> skip", current_live, bid_amount)
+                                return {"status": "error", "message": f"skipped-stale-bid:live_bid={current_live}"}
+                            break
+                elif isinstance(details, (int, float)):
+                    current_live = float(details)
+                    if current_live >= float(bid_amount):
+                        logger.info("Ephemeral pre-check: live bid(=%.2f) >= proposed(=%.2f) -> skip", current_live, bid_amount)
+                        return {"status": "error", "message": f"skipped-stale-bid:live_bid={current_live}"}
         except Exception:
-            # shouldn't happen, but be defensive
-            logger.debug("AucApi.get_current_bidding_details not available or raised; proceeding")
+            logger.debug("Ephemeral pre-check failed; proceeding", exc_info=True)
 
-        # Build headers for ephemeral connection (reuse cookie header)
         ephemeral_headers = [
             f"Cookie: {cookie_header}",
             f"Host: {host}",
@@ -321,9 +304,8 @@ def start_ws_adapter(username, password, auction_pk=None):
             "Upgrade: websocket",
             "User-Agent: ws-ephemeral/1.0"
         ]
-        # Use same ws_url as join path (server should accept place_bid frames on same endpoint)
+
         try:
-            # create_connection will do the handshake; short timeout avoids long waits
             ws_conn = websocket.create_connection(ws_url, timeout=timeout, header=ephemeral_headers, origin=origin)
         except Exception as e:
             logger.exception("Ephemeral WS connect failed: %s", e)
@@ -331,21 +313,17 @@ def start_ws_adapter(username, password, auction_pk=None):
 
         try:
             try:
-                ws_conn.settimeout(timeout)
+                ws_conn.settimeout(EPHEMERAL_RECV_TIMEOUT)
             except Exception:
                 pass
-            # send the bid payload
             ws_conn.send(json.dumps(payload))
             logger.info("EPHEMERAL WS SENT: %s", payload)
-            # wait for a response frame (short)
             try:
                 resp = ws_conn.recv()
             except Exception as e:
-                logger.warning("Ephemeral WS: no response/recv failed: %s", e)
+                logger.warning("Ephemeral recv failed: %s", e)
                 ws_conn.close()
                 return {"status": "error", "message": f"no-response:{e}"}
-
-            # try parse response
             try:
                 resp_j = json.loads(resp)
             except Exception:
@@ -357,16 +335,14 @@ def start_ws_adapter(username, password, auction_pk=None):
                 ws_conn.close()
             except Exception:
                 pass
-            logger.exception("Ephemeral WS send/recv failed: %s", e)
+            logger.exception("Ephemeral send/recv failed: %s", e)
             return {"status": "error", "message": f"sendrecv-failed:{e}"}
 
-    # -------------------------
-    # Monkey-patch submit_bid to ephemeral implementation
-    # -------------------------
+    # monkey-patch AucApi.submit_bid -> ephemeral submit
     AucApi.submit_bid = _ephemeral_ws_submit
     logger.info("Patched AucApi.submit_bid -> ephemeral websocket submit")
 
-    # ALSO patch AuctionPlayer's local submit binding (handles "from AucApi import submit_bid")
+    # also patch AuctionPlayer.submit_bid (if present)
     try:
         if hasattr(AuctionPlayer, "submit_bid"):
             AuctionPlayer.submit_bid = lambda auction_id, item_id, bid_amount, user_id=None, min_bid_amount=None: _ephemeral_ws_submit(
@@ -378,22 +354,51 @@ def start_ws_adapter(username, password, auction_pk=None):
     except Exception:
         logger.exception("Failed to patch AuctionPlayer.submit_bid")
 
-    # run persistent receive WS in separate thread (blocking run_forever). Provide origin to run_forever to be used in handshake.
-    def run():
-        # Keep reasonably short ping settings; ephemeral submits avoid keeping many sockets active.
-        ws_app.run_forever(ping_interval=30, ping_timeout=10, origin=origin)
+    # persistent ws app factory (fresh each reconnect)
+    def _new_ws_app():
+        return websocket.WebSocketApp(ws_url,
+                                      header=headers,
+                                      on_open=_on_open,
+                                      on_message=_on_message,
+                                      on_error=_on_error,
+                                      on_close=_on_close)
 
-    wst = threading.Thread(target=run)
-    wst.daemon = True
-    wst.start()
+    # reconnect loop for persistent receive WS
+    def run_loop():
+        backoff = 1
+        max_backoff = 30
+        while True:
+            try:
+                ws_app = _new_ws_app()
+                logger.info("Starting persistent WS (backoff=%s)", backoff)
+                ws_app.run_forever(ping_interval=PERSISTENT_PING_INTERVAL,
+                                   ping_timeout=PERSISTENT_PING_TIMEOUT,
+                                   origin=origin)
+                # connection closed - cleanup and reconnect after backoff
+                with _global_ws_lock:
+                    try:
+                        if _global_ws:
+                            _global_ws.close()
+                    except Exception:
+                        pass
+                    _global_ws = None
+                logger.warning("Persistent WS stopped; reconnecting after %s s", backoff)
+                time.sleep(backoff)
+                backoff = min(max_backoff, backoff * 2)
+            except Exception:
+                logger.exception("Persistent WS run loop error; sleeping then retrying")
+                time.sleep(backoff)
+                backoff = min(max_backoff, backoff * 2)
 
-    # keep main thread alive, adapter will feed AuctionPlayer via process_external_snapshot
+    t = threading.Thread(target=run_loop, daemon=True)
+    t.start()
+
+    # keep main thread alive
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Stopping ws adapter")
-        # attempt to close live ws if present
         with _global_ws_lock:
             if _global_ws:
                 try:
