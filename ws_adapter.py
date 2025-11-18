@@ -115,9 +115,6 @@ def _convert_join_response_to_snapshot(join_data: dict):
         item_map = {}
         for p in products:
             pid = p.get("auction_product_id")
-            # skip item id 7 as per your custom filter
-            if pid == 7:
-                continue
             raw_min = p.get("minimum_increment_price")
             min_bid = float(raw_min) if raw_min is not None else None
             item = {

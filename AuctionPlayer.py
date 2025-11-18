@@ -93,6 +93,7 @@ def process_snapshot(snapshot):
       - Respect max wait time (MAX_WAIT)
       - If someone else bids during our wait, skip submitting (prevents stale submits)
       - Allow repeated bidding by the bot until threshold/cap is reached
+      - NEW: process ALL items inside AUCTION_ITEMS for that auction (not just the first)
     """
     for auc_id, auc in snapshot.items():
         # Defensive: skip if auction id is falsy (None / empty). Prevent assigning bots to None.
@@ -115,187 +116,195 @@ def process_snapshot(snapshot):
             logger.info("Auction %s: bots_disabled -> skipping", auc_id)
             continue
 
-        # prepare a DecideRequest-like object expected by DecisionService.decide()
-        class R: pass
-        r = R()
-        # choose first item id robustly
+        # Get all item keys; iterate over each and run decision+submit flow per item
         item_keys = list(auc.get('AUCTION_ITEMS', {}).keys()) if auc.get('AUCTION_ITEMS') else []
-        r.item_id = item_keys[0] if item_keys else 1
-        r.auction_id = auc_id
-        r.bot_user_id = bot_id
-
-        # Build antecedent_features & auction_state minimally for DecisionService
-        r.antecedent_features = {
-            "recent_bid_rate": random.uniform(0.1, 1.0),
-            "phase_ratio": random.uniform(0.0, 1.0),
-            "time_left_pct": 0.5
-        }
-
-        item_block = _fetch_item_block(auc, r.item_id)
-        # snapshot-level values might be under item_block or auc; prefer item_block
-        snapshot_best = float(item_block.get("BEST_PRICE", auc.get("BEST_PRICE", 0)))
-        snapshot_threshold = float(item_block.get("THRESHOLD_PRICE1", auc.get("THRESHOLD_PRICE1", 0) or 0))
-
-        r.auction_state = {
-            "best_price": snapshot_best,
-            "threshold_price": snapshot_threshold
-        }
-
-        # PREFER item-level MIN_BID_AMOUNT (avoid auction-level defaults overriding item)
-        r.min_inc_price = float(item_block.get("MIN_BID_AMOUNT", auc.get("MIN_BID_AMOUNT", 1)))
-        r.max_inc_price = float(auc.get("MAX_BID_AMOUNT", item_block.get("MAX_BID_AMOUNT", r.min_inc_price * 1000)))
-        r.threshold_price = r.auction_state.get('threshold_price', 0)
-        r.step_index = 0
-
-        # fetch persisted state for this auction/bot (or default)
-        state = get_bot_state(auc_id, bot_id) or {
-            "persona_current": None,
-            "num_bids_placed": 0,
-            "budget_remaining": 100000,
-            # last_bot_bid_amount: amount bot last placed (absolute final price)
-            # last_seen_external_best: external best price observed after bot's last bid
-        }
-
-        # Now run DecisionService
-        decision = DECISION.decide(r, state)
-        if decision.get("status") != "ok":
-            logger.error("Decision failed for %s: %s", auc_id, decision)
+        if not item_keys:
+            logger.debug("Auction %s: no items in snapshot -> skipping", auc_id)
             continue
 
-        # Extract decision results
-        bid_amount_raw = decision.get("bid_amount")
-        requested_delay = int(decision.get("delay_seconds") or 1)
-        # Cap requested delay to MAX_WAIT
-        delay = min(requested_delay, MAX_WAIT)
-
-        # Recompute best_price from live API to reduce stale decisions:
-        best_price_at_decision = _safe_get_current_best(auc_id, r.item_id, snapshot_best)
-
-        # Normalize decision output into a final bid price
-        try:
-            bid_amt_f = float(bid_amount_raw)
-        except Exception:
-            logger.warning("Invalid bid_amount from decision for auction %s item %s: %r — skipping", auc_id, r.item_id, bid_amount_raw)
-            continue
-
-        # If decision returned an absolute that is already > best_price_at_decision treat as absolute,
-        # otherwise treat as increment.
-        if bid_amt_f <= best_price_at_decision:
-            final_bid = round(best_price_at_decision + bid_amt_f, 2)
-        else:
-            final_bid = round(bid_amt_f, 2)
-
-        # Ensure final_bid respects min increment
-        min_allowed = float(item_block.get("MIN_BID_AMOUNT", auc.get("MIN_BID_AMOUNT", r.min_inc_price or 1)))
-        if final_bid <= best_price_at_decision:
-            final_bid = round(best_price_at_decision + min_allowed, 2)
-
-        # Quantize to multiples of min_allowed
-        try:
-            if min_allowed > 0:
-                multiples = int((final_bid - best_price_at_decision) / min_allowed)
-                if multiples < 1:
-                    multiples = 1
-                final_bid = round(best_price_at_decision + multiples * min_allowed, 2)
-        except Exception:
-            pass
-
-        resulting_price = final_bid
-
-        # Compute max_allowed_price (authoritative)
-        max_allowed_price = extract_max_allowed_price_from_snapshot(snapshot, auc_id)
-        if max_allowed_price is None and snapshot_threshold:
+        for item_key in item_keys:
             try:
-                max_allowed_price = float(snapshot_threshold) * float(BOT_MAX_PERCENT_OF_THRESHOLD)
+                # prepare a DecideRequest-like object expected by DecisionService.decide()
+                class R: pass
+                r = R()
+                r.item_id = item_key
+                r.auction_id = auc_id
+                r.bot_user_id = bot_id
+
+                # Build antecedent_features & auction_state minimally for DecisionService
+                r.antecedent_features = {
+                    "recent_bid_rate": random.uniform(0.1, 1.0),
+                    "phase_ratio": random.uniform(0.0, 1.0),
+                    "time_left_pct": 0.5
+                }
+
+                item_block = _fetch_item_block(auc, r.item_id)
+                # snapshot-level values might be under item_block or auc; prefer item_block
+                snapshot_best = float(item_block.get("BEST_PRICE", auc.get("BEST_PRICE", 0)))
+                # support both THRESHOLD_PRICE / THRESHOLD_PRICE1 keys
+                snapshot_threshold = float(item_block.get("THRESHOLD_PRICE", item_block.get("THRESHOLD_PRICE", auc.get("THRESHOLD_PRICE", auc.get("THRESHOLD_PRICE", 0) or 0))))
+
+                r.auction_state = {
+                    "best_price": snapshot_best,
+                    "threshold_price": snapshot_threshold
+                }
+
+                # Prefer item-level MIN_BID_AMOUNT (avoid auction-level defaults overriding item)
+                r.min_inc_price = float(item_block.get("MIN_BID_AMOUNT", auc.get("MIN_BID_AMOUNT", 1)))
+                r.max_inc_price = float(auc.get("MAX_BID_AMOUNT", item_block.get("MAX_BID_AMOUNT", r.min_inc_price * 1000)))
+                r.threshold_price = r.auction_state.get('threshold_price', 0)
+                r.step_index = 0
+
+                # fetch persisted state for this auction/bot (or default)
+                state = get_bot_state(auc_id, bot_id) or {
+                    "persona_current": None,
+                    "num_bids_placed": 0,
+                    "budget_remaining": 100000,
+                }
+
+                # Now run DecisionService
+                decision = DECISION.decide(r, state)
+                if decision.get("status") != "ok":
+                    logger.error("Decision failed for %s item %s: %s", auc_id, r.item_id, decision)
+                    continue
+
+                # Extract decision results
+                bid_amount_raw = decision.get("bid_amount")
+                requested_delay = int(decision.get("delay_seconds") or 1)
+                # Cap requested delay to MAX_WAIT
+                delay = min(requested_delay, MAX_WAIT)
+
+                # Recompute best_price from live API to reduce stale decisions:
+                best_price_at_decision = _safe_get_current_best(auc_id, r.item_id, snapshot_best)
+
+                # Normalize decision output into a final bid price
+                try:
+                    bid_amt_f = float(bid_amount_raw)
+                except Exception:
+                    logger.warning("Invalid bid_amount from decision for auction %s item %s: %r — skipping", auc_id, r.item_id, bid_amount_raw)
+                    continue
+
+                # If decision returned an absolute that is already > best_price_at_decision treat as absolute,
+                # otherwise treat as increment.
+                if bid_amt_f <= best_price_at_decision:
+                    final_bid = round(best_price_at_decision + bid_amt_f, 2)
+                else:
+                    final_bid = round(bid_amt_f, 2)
+
+                # Ensure final_bid respects min increment
+                min_allowed = float(item_block.get("MIN_BID_AMOUNT", auc.get("MIN_BID_AMOUNT", r.min_inc_price or 1)))
+                if final_bid <= best_price_at_decision:
+                    final_bid = round(best_price_at_decision + min_allowed, 2)
+
+                # Quantize to multiples of min_allowed
+                try:
+                    if min_allowed > 0:
+                        multiples = int((final_bid - best_price_at_decision) / min_allowed)
+                        if multiples < 1:
+                            multiples = 1
+                        final_bid = round(best_price_at_decision + multiples * min_allowed, 2)
+                except Exception:
+                    pass
+
+                resulting_price = final_bid
+
+                # Compute max_allowed_price (authoritative)
+                max_allowed_price = extract_max_allowed_price_from_snapshot(snapshot, auc_id)
+                if max_allowed_price is None and snapshot_threshold:
+                    try:
+                        max_allowed_price = float(snapshot_threshold) * float(BOT_MAX_PERCENT_OF_THRESHOLD)
+                    except Exception:
+                        max_allowed_price = None
+
+                # Pre-submit safety gate: if final bid would exceed cap -> disable bots
+                if max_allowed_price is not None and resulting_price >= max_allowed_price:
+                    set_bots_disabled(auc_id, True)
+                    logger.info("Auction %s: proposed bot bid (%.2f) would exceed max_allowed_price %.2f. Disabling bots.",
+                                auc_id, resulting_price, max_allowed_price)
+                    continue
+
+                logger.info("Auction %s: bot %s decided final_bid=%.2f (item=%s best_now=%.2f, min_inc=%.2f) with delay=%s sec, persona=%s",
+                            auc_id, bot_id, resulting_price, r.item_id, best_price_at_decision, min_allowed, delay, decision.get("persona"))
+
+                # persist marker about scheduled bid (so other processes can inspect)
+                st = state.copy()
+                st["next_scheduled"] = (datetime.utcnow() + timedelta(seconds=delay + 5)).isoformat() + "Z"
+                st["decision_timestamp"] = datetime.utcnow().isoformat() + "Z"
+                st["decision_best_price"] = float(best_price_at_decision)
+                st["decision_final_bid"] = float(resulting_price)
+                persist_bot_state(auc_id, bot_id, st)
+
+                # Sleep for the delay (cap ensured)
+                time.sleep(delay)
+
+                # After waiting, check live best price again. If someone else bid higher AFTER our decision time,
+                # the bot should NOT submit its scheduled bid (avoid stale submits).
+                live_best_after = _safe_get_current_best(auc_id, r.item_id, snapshot_best)
+
+                # If someone else placed a higher bid than the best_price_at_decision,
+                # then our scheduled bid is stale and should be skipped.
+                if live_best_after > float(best_price_at_decision):
+                    logger.info("Auction %s: live best for item %s changed from %.2f -> %.2f during wait; skipping scheduled bid by bot %s",
+                                auc_id, r.item_id, float(best_price_at_decision), float(live_best_after), bot_id)
+                    # clear scheduling marker but DO NOT mark last_bot_bid_amount (we didn't place a bid)
+                    st2 = get_bot_state(auc_id, bot_id) or {}
+                    st2["next_scheduled"] = None
+                    persist_bot_state(auc_id, bot_id, st2)
+                    continue
+
+                # Submit using the computed absolute final price
+                submit_resp = submit_bid(auction_id=auc_id, item_id=r.item_id, bid_amount=resulting_price, user_id=bot_id)
+                logger.info("Submit bid response (auction %s item %s): %s", auc_id, r.item_id, submit_resp)
+
+                # persist updated state: mark that bot placed this bid.
+                updated_state = decision.get("updated_state", state)
+                updated_state["num_bids_placed"] = updated_state.get("num_bids_placed", 0) + 1
+                updated_state["last_action_time"] = datetime.utcnow().isoformat() + "Z"
+                updated_state["next_scheduled"] = None
+
+                # Record the absolute price bot placed so we can reference it later if needed.
+                if submit_resp.get("status") == "success":
+                    updated_state["last_bot_bid_amount"] = float(resulting_price)
+                    # We can track last_seen_external_best as well.
+                    updated_state["last_seen_external_best"] = float(_safe_get_current_best(auc_id, r.item_id, resulting_price))
+                else:
+                    # If submit failed, preserve previous value
+                    updated_state["last_bot_bid_amount"] = updated_state.get("last_bot_bid_amount")
+
+                persist_bot_state(auc_id, bot_id, updated_state)
+
+                # Post-submit: handle expiry extension and cap checks as before
+                if submit_resp.get("status") == "success":
+                    expiry_iso = get_expiry_override(auc_id) or auc.get("AUCTION_EXPIRY_DATE_TIME") or auc.get("EXPIRY")
+                    expiry_dt = None
+                    try:
+                        expiry_dt = parse(expiry_iso) if expiry_iso else None
+                    except Exception:
+                        expiry_dt = None
+
+                    if expiry_dt:
+                        secs_left = (expiry_dt - datetime.utcnow()).total_seconds()
+                        if secs_left <= AUCTION_EXTENSION_THRESHOLD_SEC:
+                            new_expiry = expiry_dt + timedelta(seconds=AUCTION_EXTENSION_SECONDS)
+                            set_expiry_override(auc_id, new_expiry.isoformat() + "Z")
+                            logger.info("Auction %s: expiry extended by %s seconds -> %s (local override)",
+                                        auc_id, AUCTION_EXTENSION_SECONDS, new_expiry.isoformat() + "Z")
+
+                    latest_resulting = resulting_price
+                    if max_allowed_price is not None and latest_resulting >= max_allowed_price:
+                        set_bots_disabled(auc_id, True)
+                        logger.info("Auction %s: bots disabled after reaching configured cap (%.2f)", auc_id, latest_resulting)
+
+                else:
+                    logger.warning("Auction %s: bid submit failed for item %s: %s", auc_id, r.item_id, submit_resp)
+                    # clear scheduling marker if submit failed
+                    st = get_bot_state(auc_id, bot_id) or {}
+                    st["next_scheduled"] = None
+                    persist_bot_state(auc_id, bot_id, st)
+
             except Exception:
-                max_allowed_price = None
-
-        # Pre-submit safety gate: if final bid would exceed cap -> disable bots
-        if max_allowed_price is not None and resulting_price >= max_allowed_price:
-            set_bots_disabled(auc_id, True)
-            logger.info("Auction %s: proposed bot bid (%.2f) would exceed max_allowed_price %.2f. Disabling bots.",
-                        auc_id, resulting_price, max_allowed_price)
-            continue
-
-        logger.info("Auction %s: bot %s decided final_bid=%.2f (best_now=%.2f, min_inc=%.2f) with delay=%s sec, persona=%s",
-                    auc_id, bot_id, resulting_price, best_price_at_decision, min_allowed, delay, decision.get("persona"))
-
-        # persist marker about scheduled bid (so other processes can inspect)
-        st = state.copy()
-        st["next_scheduled"] = (datetime.utcnow() + timedelta(seconds=delay + 5)).isoformat() + "Z"
-        st["decision_timestamp"] = datetime.utcnow().isoformat() + "Z"
-        st["decision_best_price"] = float(best_price_at_decision)
-        st["decision_final_bid"] = float(resulting_price)
-        persist_bot_state(auc_id, bot_id, st)
-
-        # Sleep for the delay (cap ensured)
-        time.sleep(delay)
-
-        # After waiting, check live best price again. If someone else bid higher AFTER our decision time,
-        # the bot should NOT submit its scheduled bid (avoid stale submits).
-        live_best_after = _safe_get_current_best(auc_id, r.item_id, snapshot_best)
-
-        # If someone else placed a higher bid than the best_price_at_decision,
-        # then our scheduled bid is stale and should be skipped.
-        if live_best_after > float(best_price_at_decision):
-            logger.info("Auction %s: live best changed from %.2f -> %.2f during wait; skipping scheduled bid by bot %s",
-                        auc_id, float(best_price_at_decision), float(live_best_after), bot_id)
-            # clear scheduling marker but DO NOT mark last_bot_bid_amount (we didn't place a bid)
-            st2 = get_bot_state(auc_id, bot_id) or {}
-            st2["next_scheduled"] = None
-            persist_bot_state(auc_id, bot_id, st2)
-            continue
-
-        # Submit using the computed absolute final price
-        submit_resp = submit_bid(auction_id=auc_id, item_id=r.item_id, bid_amount=resulting_price, user_id=bot_id)
-        logger.info("Submit bid response: %s", submit_resp)
-
-        # persist updated state: mark that bot placed this bid.
-        updated_state = decision.get("updated_state", state)
-        updated_state["num_bids_placed"] = updated_state.get("num_bids_placed", 0) + 1
-        updated_state["last_action_time"] = datetime.utcnow().isoformat() + "Z"
-        updated_state["next_scheduled"] = None
-
-        # Record the absolute price bot placed so we can reference it later if needed.
-        if submit_resp.get("status") == "success":
-            updated_state["last_bot_bid_amount"] = float(resulting_price)
-            # We can track last_seen_external_best as well.
-            updated_state["last_seen_external_best"] = float(_safe_get_current_best(auc_id, r.item_id, resulting_price))
-        else:
-            # If submit failed, preserve previous value
-            updated_state["last_bot_bid_amount"] = updated_state.get("last_bot_bid_amount")
-
-        persist_bot_state(auc_id, bot_id, updated_state)
-
-        # Post-submit: handle expiry extension and cap checks as before
-        if submit_resp.get("status") == "success":
-            expiry_iso = get_expiry_override(auc_id) or auc.get("AUCTION_EXPIRY_DATE_TIME") or auc.get("EXPIRY")
-            expiry_dt = None
-            try:
-                expiry_dt = parse(expiry_iso) if expiry_iso else None
-            except Exception:
-                expiry_dt = None
-
-            if expiry_dt:
-                secs_left = (expiry_dt - datetime.utcnow()).total_seconds()
-                if secs_left <= AUCTION_EXTENSION_THRESHOLD_SEC:
-                    new_expiry = expiry_dt + timedelta(seconds=AUCTION_EXTENSION_SECONDS)
-                    set_expiry_override(auc_id, new_expiry.isoformat() + "Z")
-                    logger.info("Auction %s: expiry extended by %s seconds -> %s (local override)",
-                                auc_id, AUCTION_EXTENSION_SECONDS, new_expiry.isoformat() + "Z")
-
-            latest_resulting = resulting_price
-            if max_allowed_price is not None and latest_resulting >= max_allowed_price:
-                set_bots_disabled(auc_id, True)
-                logger.info("Auction %s: bots disabled after reaching configured cap (%.2f)", auc_id, latest_resulting)
-
-        else:
-            logger.warning("Auction %s: bid submit failed: %s", auc_id, submit_resp)
-            # clear scheduling marker if submit failed
-            st = get_bot_state(auc_id, bot_id) or {}
-            st["next_scheduled"] = None
-            persist_bot_state(auc_id, bot_id, st)
-
+                logger.exception("Error processing auction %s item %s – continuing with next item", auc_id, item_key)
+                # continue with next item
 
 # optional main runner (commented)
 # def main():
